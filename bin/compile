@@ -1,0 +1,94 @@
+#!/bin/bash
+# bin/compile <build-dir> <cache-dir> <env-path>
+
+EXISTING_LVNS=$(cat $2/EXISTING_LVNS)
+
+if [ ! -z "$EXISTING_LVNS" ]; then
+    echo "LVNs already purchased: $EXISTING_LVNS"
+    exit 0
+fi
+
+# Params
+api_key=`cat $3/API_KEY` 
+api_secret=`cat $3/API_SECRET`
+cc=`cat $3/CC`
+name=`cat $3/NAME`
+
+# Search for and buy a number
+all_lvns=''
+IFS=',' read -r -a countries <<< "$cc"
+
+for country in "${countries[@]}"; do
+echo "-----> Searching for Number in $country"
+
+curl -s -H "Accept: application/json" "https://rest.nexmo.com/number/search?api_key=$api_key&api_secret=$api_secret&country=$country&size=1&features=sms" > $1/number.json
+
+lvn=`python << END
+import json
+
+with open('$1/number.json') as f:
+    datafile = f.read()
+data = json.loads(datafile)
+print(data['numbers'][0]['msisdn'])
+END
+`
+rm $1/number.json
+
+echo "-----> Purchasing Number: $lvn"
+curl -s https://rest.nexmo.com/number/buy -d api_key=$api_key -d api_secret=$api_secret -d country=$country -d msisdn=$lvn > $1/purchase.json
+
+purchase_response=`python << END
+import json
+
+with open('$1/purchase.json') as f:
+    datafile = f.read()
+data = json.loads(datafile)
+print(data['error-code-label'])
+END
+`
+
+rm $1/purchase.json
+
+if [ "$purchase_response" != "success" ]; then
+  echo $purchase_response;
+  exit 1
+fi
+
+echo "-----> Linking Number to Webhook: $lvn"
+curl -s https://rest.nexmo.com/number/update -d api_key=$api_key -d api_secret=$api_secret -d country=$country -d msisdn=$lvn -d moHttpUrl=https://$name.herokuapp.com/webhooks/inbound-sms > $1/link.json
+
+linking_response=`python << END
+import json
+
+with open('$1/link.json') as f:
+    datafile = f.read()
+data = json.loads(datafile)
+print(data['error-code-label'])
+END
+`
+
+if [ "$linking_response" != "success" ]; then
+  echo $linking_response;
+  exit 1
+fi
+
+rm $1/link.json
+
+all_lvns="$all_lvns$lvn,"
+done
+
+all_lvns=$(echo $all_lvns | sed 's/,$//')
+
+echo "-----> Setting Env Vars"
+touch $1/.env
+echo "MY_LVN=$all_lvns" >> $1/.env
+
+echo "-----> Adding .profile.d script"
+curl -s -o $1/.profile.d/nexmo_env_setup.sh https://raw.githubusercontent.com/nexmo-community/heroku-buildpack-sms/master/nexmo_env_setup.sh
+
+echo "-----> Adding existing LVNs to cache"
+echo $all_lvns > $2/EXISTING_LVNS
+
+echo ""
+echo "Nexmo Setup COMPLETE Your Numbers: $all_lvns"
+echo ""
